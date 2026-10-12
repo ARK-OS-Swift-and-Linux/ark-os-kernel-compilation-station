@@ -1,0 +1,10 @@
+# Build artifacts and temporary files
+build/
+dist/
+*.tar
+*.tar.gz
+*.tar.xz
+*.part*
+*.iso
+*.img
+.config.old

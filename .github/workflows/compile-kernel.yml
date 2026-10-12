@@ -1,0 +1,197 @@
+name: Zen Kernel Compilation Station
+
+on:
+  schedule:
+    # Run automatically every 6 hours to check for new upstream tags
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Specific Zen kernel tag (e.g., v7.2.10-zen1; leave empty for latest)'
+        required: false
+        default: ''
+      config_profile:
+        description: 'Kernel configuration profile to build'
+        required: true
+        default: 'config/laptop-zen.config'
+        type: choice
+        options:
+          - 'config/laptop-zen.config'
+          - 'config/qemu-minimal.config'
+      force:
+        description: 'Force rebuild even if release already exists'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - 'config/**'
+      - '.github/workflows/compile-kernel.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Determine target Zen kernel tag
+        id: tag_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TARGET_TAG="$INPUT_TAG"
+            echo "Using manually specified tag: $TARGET_TAG"
+          else
+            echo "Checking latest tag on upstream zen-kernel repository..."
+            TARGET_TAG=$(git ls-remote --tags --refs https://github.com/zen-kernel/zen-kernel.git 'v*-zen*' | awk -F'/' '{print $3}' | sort -V | tail -n1)
+            echo "Latest upstream tag detected: $TARGET_TAG"
+          fi
+
+          echo "target_tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+
+          # Check if this tag has already been built and released
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1 && [ "$FORCE_BUILD" != "true" ]; then
+            echo "Release $TARGET_TAG already exists in this repository. Skipping compilation."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Proceeding with build for tag $TARGET_TAG"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install kernel build dependencies
+        if: steps.tag_check.outputs.should_build == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libncurses-dev \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            zstd \
+            tar \
+            xz-utils \
+            libdw-dev \
+            dwarves
+
+      - name: Clone Zen Kernel repository
+        if: steps.tag_check.outputs.should_build == 'true'
+        run: |
+          TARGET_TAG="${{ steps.tag_check.outputs.target_tag }}"
+          echo "Cloning Zen kernel at tag $TARGET_TAG..."
+          git clone --depth 1 --branch "$TARGET_TAG" https://github.com/zen-kernel/zen-kernel.git kernel-src
+
+      - name: Configure Kernel
+        if: steps.tag_check.outputs.should_build == 'true'
+        run: |
+          CONFIG_FILE="${{ inputs.config_profile || 'config/laptop-zen.config' }}"
+          echo "Applying configuration profile: $CONFIG_FILE"
+          cp "$CONFIG_FILE" kernel-src/.config
+
+          # Optimize for CI build constraints: disable heavyweight debug symbols
+          # and clear external certificate lists to prevent build failure on standard runners
+          kernel-src/scripts/config --file kernel-src/.config --disable DEBUG_INFO
+          kernel-src/scripts/config --file kernel-src/.config --enable DEBUG_INFO_NONE
+          kernel-src/scripts/config --file kernel-src/.config --disable DEBUG_INFO_BTF
+          kernel-src/scripts/config --file kernel-src/.config --set-str SYSTEM_TRUSTED_KEYS ""
+          kernel-src/scripts/config --file kernel-src/.config --set-str SYSTEM_REVOCATION_KEYS ""
+
+          # Update config to resolve any newly introduced Kconfig symbols
+          make -C kernel-src olddefconfig
+
+      - name: Compile Kernel and Modules
+        if: steps.tag_check.outputs.should_build == 'true'
+        run: |
+          CORES=$(nproc)
+          echo "Compiling kernel using $CORES CPU cores..."
+          make -C kernel-src -j"$CORES" bzImage modules
+
+      - name: Stage Distribution Package
+        if: steps.tag_check.outputs.should_build == 'true'
+        run: |
+          TARGET_TAG="${{ steps.tag_check.outputs.target_tag }}"
+          mkdir -p dist/boot dist/modules
+
+          # Copy kernel image, symbol map, and configuration
+          cp kernel-src/arch/x86/boot/bzImage dist/boot/bzImage
+          cp kernel-src/System.map dist/boot/System.map
+          cp kernel-src/.config dist/boot/config
+          echo "$TARGET_TAG" > dist/boot/kernel-version.txt
+
+          # Install stripped modules
+          echo "Installing stripped modules..."
+          make -C kernel-src INSTALL_MOD_PATH=../dist/modules INSTALL_MOD_STRIP=1 modules_install
+
+      - name: Create Archive and Split into 2GB Chunks
+        if: steps.tag_check.outputs.should_build == 'true'
+        run: |
+          echo "Compressing distribution tree into kernel.tar.xz..."
+          tar -cJf kernel.tar.xz -C dist .
+
+          mkdir -p release-parts
+          echo "Splitting archive into 2000MB parts with prefix img_..."
+          split -b 2000M -d kernel.tar.xz release-parts/img_
+
+          # Create SHA256 verification sums
+          cd release-parts
+          sha256sum img_* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload Artifacts
+        if: steps.tag_check.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-${{ steps.tag_check.outputs.target_tag }}
+          path: release-parts/
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: steps.tag_check.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag_check.outputs.target_tag }}
+          name: ARK-OS Linux Zen Kernel (${{ steps.tag_check.outputs.target_tag }})
+          draft: false
+          prerelease: false
+          files: release-parts/*
+          body: |
+            Automated Linux Zen Kernel build for ARK-OS.
+
+            - **Upstream Tag:** `${{ steps.tag_check.outputs.target_tag }}`
+            - **Upstream Repository:** https://github.com/zen-kernel/zen-kernel
+            - **Target Architecture:** x86_64
+
+            ### Reassembly and Usage Instructions
+
+            After downloading all release parts into a directory:
+
+            ```bash
+            # 1. Verify file checksums
+            sha256sum -c SHA256SUMS.txt
+
+            # 2. Reassemble the split parts into the archive
+            cat img_* > kernel.tar.xz
+
+            # 3. Extract the kernel image and modules
+            tar -xvf kernel.tar.xz
+            ```
+
+            Extracted contents:
+            - `boot/bzImage`: 64-bit kernel executable image for QEMU / direct boot
+            - `boot/System.map`: Symbol map
+            - `boot/config`: Kernel configuration used for compilation
+            - `modules/lib/modules/`: Staged kernel modules
